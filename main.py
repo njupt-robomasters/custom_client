@@ -13,7 +13,7 @@ import paho.mqtt.client as mqtt
 from rm_custom_proto import CustomByteBlock, GlobalUnitStatus
 
 
-BROKER_HOST = "127.0.0.1"
+BROKER_HOST = "192.168.12.1"
 BROKER_PORT = 3333
 TOPIC_GLOBAL_UNIT_STATUS = "GlobalUnitStatus"
 TOPIC_CUSTOM_BYTE_BLOCK = "CustomByteBlock"
