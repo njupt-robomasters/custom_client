@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import struct
 import threading
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import dataclass
@@ -66,6 +67,7 @@ def _select_font_family(root: tk.Misc) -> str:
     try:
         available = set(tkfont.families(root))
     except Exception:
+        traceback.print_exc()
         available = set()
 
     for family in PREFERRED_FONT_FAMILIES:
@@ -76,6 +78,7 @@ def _select_font_family(root: tk.Misc) -> str:
     try:
         FONT_FAMILY = tkfont.nametofont("TkDefaultFont").cget("family")
     except Exception:
+        traceback.print_exc()
         FONT_FAMILY = "sans-serif"
     return FONT_FAMILY
 
@@ -93,6 +96,19 @@ def _safe_int(value) -> int:
         return int(value)
     except Exception:
         return 0
+
+
+def _print_exception(prefix: str, exc: BaseException | None = None) -> None:
+    print(prefix, flush=True)
+    if exc is None:
+        traceback.print_exc()
+    else:
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+
+def _thread_exception_hook(args) -> None:
+    print(f"[THREAD] {args.thread.name} crashed", flush=True)
+    traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
 
 
 def _hex_preview(data: bytes, limit: int = 32) -> str:
@@ -691,6 +707,7 @@ class CustomClientApp:
             client.loop_start()
             self.mqtt_client = client
         except Exception as exc:
+            _print_exception("[MQTT] connect failed", exc)
             message = str(exc)
             self.root.after(0, lambda message=message: self._connection_failed(message))
 
@@ -704,16 +721,19 @@ class CustomClientApp:
         self._show_selection()
 
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
-        if self.closing:
-            return
+        try:
+            if self.closing:
+                return
 
-        if _safe_int(reason_code) != 0:
-            self.root.after(0, lambda: self._connection_failed(f"MQTT 返回码 {reason_code}"))
-            return
+            if _safe_int(reason_code) != 0:
+                self.root.after(0, lambda: self._connection_failed(f"MQTT ??? {reason_code}"))
+                return
 
-        client.subscribe(TOPIC_GLOBAL_UNIT_STATUS, qos=1)
-        client.subscribe(TOPIC_CUSTOM_BYTE_BLOCK, qos=1)
-        self.root.after(0, self._connected_ui)
+            client.subscribe(TOPIC_GLOBAL_UNIT_STATUS, qos=1)
+            client.subscribe(TOPIC_CUSTOM_BYTE_BLOCK, qos=1)
+            self.root.after(0, self._connected_ui)
+        except Exception as exc:
+            _print_exception("[MQTT] on_connect crashed", exc)
 
     def _connected_ui(self) -> None:
         self.connected = True
@@ -727,11 +747,14 @@ class CustomClientApp:
         self.page_footer.config(text=f"client_id {self.client_id} | 主题 {TOPIC_GLOBAL_UNIT_STATUS}, {TOPIC_CUSTOM_BYTE_BLOCK}")
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties) -> None:
-        if self.closing:
-            return
+        try:
+            if self.closing:
+                return
 
-        self.connected = False
-        self.root.after(0, lambda: self.connection_label.config(text=f"连接已断开：{reason_code}"))
+            self.connected = False
+            self.root.after(0, lambda: self.connection_label.config(text=f"??????{reason_code}"))
+        except Exception as exc:
+            _print_exception("[MQTT] on_disconnect crashed", exc)
 
     def _on_message(self, client, userdata, msg) -> None:
         try:
@@ -750,11 +773,10 @@ class CustomClientApp:
                 parsed = CustomByteBlock()
                 parsed.ParseFromString(msg.payload)
                 raw_data = bytes(getattr(parsed, "data", b""))
-                diag: dict[str, object] = {}
-                opponent = _parse_opponent_snapshot(raw_data, diag=diag)
+                opponent = _parse_opponent_snapshot(raw_data)
                 self.incoming.put(("opponent", opponent))
-        except Exception:
-            return
+        except Exception as exc:
+            _print_exception(f"[MQTT] message crashed topic={getattr(msg, 'topic', '?')}", exc)
 
     def _poll_messages(self) -> None:
         latest_status: StatusSnapshot | None = None
@@ -769,6 +791,8 @@ class CustomClientApp:
                     latest_opponent = payload  # type: ignore[assignment]
         except queue.Empty:
             pass
+        except Exception as exc:
+            _print_exception("[UI] poll crashed", exc)
 
         if latest_status is not None:
             self.latest_status = latest_status
@@ -849,12 +873,12 @@ class CustomClientApp:
             return
         try:
             client.loop_stop()
-        except Exception:
-            pass
+        except Exception as exc:
+            _print_exception("[MQTT] loop_stop crashed", exc)
         try:
             client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            _print_exception("[MQTT] disconnect crashed", exc)
 
     def on_close(self) -> None:
         self.closing = True
@@ -863,7 +887,12 @@ class CustomClientApp:
 
 
 def main() -> None:
+    threading.excepthook = _thread_exception_hook
     root = tk.Tk()
+    def report_callback_exception(exc, val, tb):
+        print("[TK] callback crashed", flush=True)
+        traceback.print_exception(exc, val, tb)
+    root.report_callback_exception = report_callback_exception
     CustomClientApp(root)
     root.mainloop()
 
