@@ -13,7 +13,7 @@ import paho.mqtt.client as mqtt
 from rm_custom_proto import CustomByteBlock, GlobalUnitStatus
 
 
-BROKER_HOST = "192.168.12.1"
+BROKER_HOST = "127.0.0.1"
 BROKER_PORT = 3333
 TOPIC_GLOBAL_UNIT_STATUS = "GlobalUnitStatus"
 TOPIC_CUSTOM_BYTE_BLOCK = "CustomByteBlock"
@@ -29,6 +29,7 @@ PREFERRED_FONT_FAMILIES = [
 ]
 
 FONT_FAMILY = "Noto Sans CJK SC"
+DEBUG_LOGGING = False
 
 RED_IDS = [1, 2, 3, 4, 6]
 BLUE_IDS = [101, 102, 103, 104, 106]
@@ -66,8 +67,8 @@ def _select_font_family(root: tk.Misc) -> str:
 
     try:
         available = set(tkfont.families(root))
-    except Exception:
-        traceback.print_exc()
+    except Exception as exc:
+        _print_exception("[UI] font family lookup failed", exc)
         available = set()
 
     for family in PREFERRED_FONT_FAMILIES:
@@ -77,8 +78,8 @@ def _select_font_family(root: tk.Misc) -> str:
 
     try:
         FONT_FAMILY = tkfont.nametofont("TkDefaultFont").cget("family")
-    except Exception:
-        traceback.print_exc()
+    except Exception as exc:
+        _print_exception("[UI] default font lookup failed", exc)
         FONT_FAMILY = "sans-serif"
     return FONT_FAMILY
 
@@ -98,7 +99,21 @@ def _safe_int(value) -> int:
         return 0
 
 
+def _set_debug_logging(enabled: bool) -> None:
+    global DEBUG_LOGGING
+    DEBUG_LOGGING = bool(enabled)
+
+
+def _debug_print(*args, **kwargs) -> None:
+    if not DEBUG_LOGGING:
+        return
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+
+
 def _print_exception(prefix: str, exc: BaseException | None = None) -> None:
+    if not DEBUG_LOGGING:
+        return
     print(prefix, flush=True)
     if exc is None:
         traceback.print_exc()
@@ -107,8 +122,48 @@ def _print_exception(prefix: str, exc: BaseException | None = None) -> None:
 
 
 def _thread_exception_hook(args) -> None:
+    if not DEBUG_LOGGING:
+        return
     print(f"[THREAD] {args.thread.name} crashed", flush=True)
     traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+
+def _tk_callback_exception(exc, val, tb) -> None:
+    if not DEBUG_LOGGING:
+        return
+    print("[TK] callback crashed", flush=True)
+    traceback.print_exception(exc, val, tb)
+
+
+def _log_mqtt_received(topic: str) -> None:
+    _debug_print(f"[MQTT] recv topic={topic}")
+
+
+def _log_mqtt_payload(topic: str, payload: bytes) -> None:
+    _debug_print(
+        f"[MQTT] payload topic={topic} len={len(payload)} hex={payload.hex(' ')}",
+    )
+
+
+def _format_optional_int_list(values: list[int | None]) -> str:
+    return "[" + ", ".join("-" if value is None else str(value) for value in values) + "]"
+
+
+def _log_status_snapshot(snapshot: StatusSnapshot) -> None:
+    _debug_print(
+        "[MQTT] parsed topic=GlobalUnitStatus "
+        f"robot_health={snapshot.robot_health} "
+        f"total_damage_ally={snapshot.total_damage_ally} "
+        f"total_damage_enemy={snapshot.total_damage_enemy}",
+    )
+
+
+def _log_opponent_snapshot(snapshot: OpponentSnapshot) -> None:
+    _debug_print(
+        "[MQTT] parsed topic=CustomByteBlock "
+        f"robot_bullets={_format_optional_int_list(snapshot.robot_bullets)} "
+        f"remaining_gold={snapshot.remaining_gold if snapshot.remaining_gold is not None else '-'}",
+    )
 
 
 def _hex_preview(data: bytes, limit: int = 32) -> str:
@@ -413,6 +468,7 @@ class CustomClientApp:
 
         self.ally_tiles: list[RobotTile] = []
         self.enemy_tiles: list[RobotTile] = []
+        self.debug_logging_var = tk.BooleanVar(value=DEBUG_LOGGING)
 
         self.root.configure(bg=self.theme["page_bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -442,6 +498,21 @@ class CustomClientApp:
             fg="#cbd5e1",
             font=_ui_font(11),
         ).pack(anchor="w", padx=34)
+        tk.Checkbutton(
+            self.selection_banner,
+            text="调试日志",
+            variable=self.debug_logging_var,
+            command=self._toggle_debug_logging,
+            bg="#1f2937",
+            fg="#e5e7eb",
+            activebackground="#1f2937",
+            activeforeground="#ffffff",
+            selectcolor="#111827",
+            font=_ui_font(10, True),
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        ).pack(anchor="w", padx=30, pady=(6, 0))
 
         self.selection_body = tk.Frame(self.selection_frame, bg="#f9fafb")
         self.selection_body.pack(fill="both", expand=True)
@@ -645,6 +716,9 @@ class CustomClientApp:
         self.selection_frame.pack_forget()
         self.status_frame.pack(fill="both", expand=True)
 
+    def _toggle_debug_logging(self) -> None:
+        _set_debug_logging(self.debug_logging_var.get())
+
     def _start_connection(self, client_id: int) -> None:
         if self.connected or self.mqtt_client is not None:
             return
@@ -681,11 +755,13 @@ class CustomClientApp:
             tile.frame.config(bg=self.theme["panel_bg"], highlightbackground=self.theme["panel_border"], highlightcolor=self.theme["panel_border"])
             tile.label.config(bg=self.theme["panel_bg"])
             tile.health_text.config(bg=self.theme["panel_bg"])
+            tile.health_text.config(fg=self.theme["ally_fill"])
             tile.extra_text.config(bg=self.theme["panel_bg"])
         for tile in self.enemy_tiles:
             tile.frame.config(bg=self.theme["panel_bg"], highlightbackground=self.theme["panel_border"], highlightcolor=self.theme["panel_border"])
             tile.label.config(bg=self.theme["panel_bg"])
             tile.health_text.config(bg=self.theme["panel_bg"])
+            tile.health_text.config(fg=self.theme["enemy_fill"])
             tile.extra_text.config(bg=self.theme["panel_bg"])
 
         self.page_footer.config(text=f"Server {BROKER_HOST}:{BROKER_PORT} | client_id {self.client_id or ''}")
@@ -758,6 +834,9 @@ class CustomClientApp:
 
     def _on_message(self, client, userdata, msg) -> None:
         try:
+            topic = str(getattr(msg, "topic", "?"))
+            _log_mqtt_received(topic)
+            _log_mqtt_payload(topic, bytes(getattr(msg, "payload", b"")))
             if msg.topic == TOPIC_GLOBAL_UNIT_STATUS:
                 parsed = GlobalUnitStatus()
                 parsed.ParseFromString(msg.payload)
@@ -766,6 +845,7 @@ class CustomClientApp:
                     total_damage_ally=_safe_int(getattr(parsed, "total_damage_ally", 0)),
                     total_damage_enemy=_safe_int(getattr(parsed, "total_damage_enemy", 0)),
                 )
+                _log_status_snapshot(snapshot)
                 self.incoming.put(("status", snapshot))
                 return
 
@@ -774,6 +854,7 @@ class CustomClientApp:
                 parsed.ParseFromString(msg.payload)
                 raw_data = bytes(getattr(parsed, "data", b""))
                 opponent = _parse_opponent_snapshot(raw_data)
+                _log_opponent_snapshot(opponent)
                 self.incoming.put(("opponent", opponent))
         except Exception as exc:
             _print_exception(f"[MQTT] message crashed topic={getattr(msg, 'topic', '?')}", exc)
@@ -889,10 +970,7 @@ class CustomClientApp:
 def main() -> None:
     threading.excepthook = _thread_exception_hook
     root = tk.Tk()
-    def report_callback_exception(exc, val, tb):
-        print("[TK] callback crashed", flush=True)
-        traceback.print_exception(exc, val, tb)
-    root.report_callback_exception = report_callback_exception
+    root.report_callback_exception = _tk_callback_exception
     CustomClientApp(root)
     root.mainloop()
 
