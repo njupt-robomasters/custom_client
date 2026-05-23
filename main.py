@@ -12,7 +12,7 @@ import paho.mqtt.client as mqtt
 from rm_custom_proto import CustomByteBlock, GlobalUnitStatus
 
 
-BROKER_HOST = "192.168.12.1"
+BROKER_HOST = "127.0.0.1"
 BROKER_PORT = 3333
 TOPIC_GLOBAL_UNIT_STATUS = "GlobalUnitStatus"
 TOPIC_CUSTOM_BYTE_BLOCK = "CustomByteBlock"
@@ -95,61 +95,72 @@ def _safe_int(value) -> int:
         return 0
 
 
+def _hex_preview(data: bytes, limit: int = 32) -> str:
+    if not data:
+        return "-"
+    preview = data[:limit].hex(" ")
+    if len(data) > limit:
+        return f"{preview} ..."
+    return preview
+
+
 def _u16(data: bytes, offset: int) -> int:
     if offset + 2 > len(data):
         return 0
     return struct.unpack_from("<H", data, offset)[0]
 
 
+def _u16_optional(data: bytes, offset: int) -> int | None:
+    if offset + 2 > len(data):
+        return None
+    return struct.unpack_from("<H", data, offset)[0]
+
+
 def _crc8(data: bytes) -> int:
-    poly = 0x31
     crc = 0xFF
     for byte in data:
         crc ^= byte
         for _ in range(8):
-            if crc & 0x80:
-                crc = ((crc << 1) ^ poly) & 0xFF
-            else:
-                crc = (crc << 1) & 0xFF
+            crc = ((crc >> 1) ^ 0x8C) if crc & 0x01 else (crc >> 1)
     return crc
 
 
 def _crc16(data: bytes) -> int:
-    poly = 0x1021
     crc = 0xFFFF
     for byte in data:
-        crc ^= byte << 8
+        crc ^= byte
         for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ poly) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
+            crc = ((crc >> 1) ^ 0x8408) if crc & 0x0001 else (crc >> 1)
     return crc
 
 
 @dataclass
 class StatusSnapshot:
     robot_health: list[int]
-    robot_bullets: list[int]
     total_damage_ally: int
     total_damage_enemy: int
 
 
 @dataclass
 class OpponentSnapshot:
-    robot_health: list[int]
-    robot_bullets: list[int]
-    remaining_gold: int
+    robot_bullets: list[int | None]
+    remaining_gold: int | None
 
 
-def _decode_rm_frames(payload: bytes) -> dict[int, bytes]:
+def _decode_rm_frames(payload: bytes, *, diag: dict[str, object] | None = None) -> dict[int, bytes]:
     frames: dict[int, bytes] = {}
     index = 0
     limit = len(payload)
+    crc8_fail = 0
+    crc16_fail = 0
+    skipped_bytes = 0
+    cmd_ids: list[int] = []
+    candidate_headers: list[tuple[int, str, int]] = []
 
     while index + 9 <= limit:
         if payload[index] != 0xA5:
             index += 1
+            skipped_bytes += 1
             continue
 
         if index + 5 > limit:
@@ -157,47 +168,72 @@ def _decode_rm_frames(payload: bytes) -> dict[int, bytes]:
 
         header = payload[index : index + 5]
         if _crc8(header[:4]) != header[4]:
+            candidate_headers.append((index, header[:5].hex(" "), _crc8(header[:4])))
             index += 1
+            crc8_fail += 1
             continue
 
         data_length = int.from_bytes(header[1:3], "little")
         total_length = 5 + 2 + data_length + 2
         if index + total_length > limit:
+            if diag is not None:
+                diag["truncated"] = True
             break
 
         frame = payload[index : index + total_length]
         if _crc16(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
             index += 1
+            crc16_fail += 1
             continue
 
         cmd_id = int.from_bytes(frame[5:7], "little")
         frames[cmd_id] = frame[7:-2]
+        cmd_ids.append(cmd_id)
         index += total_length
+
+    if diag is not None:
+        diag["payload_len"] = len(payload)
+        diag["a5_count"] = payload.count(0xA5)
+        diag["skipped_bytes"] = skipped_bytes
+        diag["crc8_fail"] = crc8_fail
+        diag["crc16_fail"] = crc16_fail
+        diag["frame_count"] = len(frames)
+        diag["cmd_ids"] = cmd_ids
+        diag["candidate_headers"] = candidate_headers
 
     return frames
 
 
-def _parse_opponent_snapshot(payload: bytes) -> OpponentSnapshot:
-    frames = _decode_rm_frames(payload)
-    health_frame = frames.get(0x0A02, b"")
+def _parse_opponent_snapshot(payload: bytes, *, diag: dict[str, object] | None = None) -> OpponentSnapshot:
+    frames = _decode_rm_frames(payload, diag=diag)
     bullet_frame = frames.get(0x0A03, b"")
     gold_frame = frames.get(0x0A04, b"")
 
-    robot_health = [
-        _u16(health_frame, 0),
-        _u16(health_frame, 2),
-        _u16(health_frame, 4),
-        _u16(health_frame, 6),
-        _u16(health_frame, 10),
-    ]
+    if diag is not None:
+        diag["bullet_frame_len"] = len(bullet_frame)
+        diag["gold_frame_len"] = len(gold_frame)
+        diag["bullet_frame_preview"] = _hex_preview(bullet_frame)
+        diag["gold_frame_preview"] = _hex_preview(gold_frame)
+
     robot_bullets = [
-        _u16(bullet_frame, 0),
-        _u16(bullet_frame, 2),
-        _u16(bullet_frame, 4),
-        _u16(bullet_frame, 6),
-        _u16(bullet_frame, 8),
+        _u16_optional(bullet_frame, 0),
+        _u16_optional(bullet_frame, 2),
+        _u16_optional(bullet_frame, 4),
+        _u16_optional(bullet_frame, 6),
+        _u16_optional(bullet_frame, 8),
     ]
-    return OpponentSnapshot(robot_health=robot_health, robot_bullets=robot_bullets, remaining_gold=_u16(gold_frame, 0))
+    return OpponentSnapshot(robot_bullets=robot_bullets, remaining_gold=_u16_optional(gold_frame, 0))
+
+
+def _status_tile_values(health: list[int]) -> list[tuple[int | None, int | None]]:
+    return [
+        (health[0], None),
+        (health[1], None),
+        (health[2], None),
+        (health[3], None),
+        (None, None),
+        (health[4], None),
+    ]
 
 
 class RobotTile:
@@ -227,6 +263,8 @@ class RobotTile:
             bg=panel_bg,
             fg=fill,
             font=_ui_font(28, True),
+            width=5,
+            anchor="center",
         )
         self.health_text.grid(row=1, column=0, sticky="ew", padx=10, pady=(6, 0))
 
@@ -236,6 +274,7 @@ class RobotTile:
             bg=panel_bg,
             fg="#6b7280",
             font=_ui_font(10),
+            width=5,
             anchor="center",
         )
         self.extra_text.grid(row=2, column=0, sticky="nsew", padx=0, pady=(4, 12))
@@ -248,7 +287,7 @@ class RobotTile:
         if bullets is None:
             self.extra_text.config(text="-")
         else:
-            self.extra_text.config(text=f"允许发弹量 {max(0, int(bullets))}")
+            self.extra_text.config(text=str(max(0, int(bullets))), fg="#9ca3af")
 
 
 class DualMetricCard:
@@ -333,8 +372,8 @@ class SingleMetricCard:
     def grid(self, **kwargs):
         self.frame.grid(**kwargs)
 
-    def update(self, value: int) -> None:
-        self.value.config(text=str(max(0, int(value))))
+    def update(self, value: int | None) -> None:
+        self.value.config(text="-" if value is None else str(max(0, int(value))))
 
 
 class CustomClientApp:
@@ -499,7 +538,7 @@ class CustomClientApp:
 
         tk.Label(
             health_card,
-            text="双方机器人血量",
+            text="血量/发弹量",
             bg=self.theme["panel_bg"],
             fg="#111827",
             font=_ui_font(13, True),
@@ -701,7 +740,6 @@ class CustomClientApp:
                 parsed.ParseFromString(msg.payload)
                 snapshot = StatusSnapshot(
                     robot_health=[int(v) for v in parsed.robot_health],
-                    robot_bullets=[int(v) for v in parsed.robot_bullets],
                     total_damage_ally=_safe_int(getattr(parsed, "total_damage_ally", 0)),
                     total_damage_enemy=_safe_int(getattr(parsed, "total_damage_enemy", 0)),
                 )
@@ -711,7 +749,9 @@ class CustomClientApp:
             if msg.topic == TOPIC_CUSTOM_BYTE_BLOCK:
                 parsed = CustomByteBlock()
                 parsed.ParseFromString(msg.payload)
-                opponent = _parse_opponent_snapshot(bytes(getattr(parsed, "data", b"")))
+                raw_data = bytes(getattr(parsed, "data", b""))
+                diag: dict[str, object] = {}
+                opponent = _parse_opponent_snapshot(raw_data, diag=diag)
                 self.incoming.put(("opponent", opponent))
         except Exception:
             return
@@ -734,8 +774,8 @@ class CustomClientApp:
             self.latest_status = latest_status
             self._apply_status(latest_status)
         if latest_opponent is not None:
-            self.latest_opponent = latest_opponent
-            self._apply_opponent(latest_opponent)
+            self.latest_opponent = self._merge_opponent(latest_opponent)
+            self._apply_opponent(self.latest_opponent)
 
         self.root.after(100, self._poll_messages)
 
@@ -743,45 +783,63 @@ class CustomClientApp:
         health = list(snapshot.robot_health[:10])
         if len(health) < 10:
             health.extend([0] * (10 - len(health)))
-        bullets = list(snapshot.robot_bullets[:5])
-        if len(bullets) < 5:
-            bullets.extend([0] * (5 - len(bullets)))
-
-        ally_values = [
-            (health[0], bullets[0]),
-            (health[1], None),
-            (health[2], bullets[1]),
-            (health[3], bullets[2]),
-            (None, bullets[3]),
-            (health[4], bullets[4]),
-        ]
+        ally_values = _status_tile_values(health[:5])
         for tile, (value, bullets) in zip(self.ally_tiles, ally_values):
             tile.set_value(value, bullets)
 
         self.damage_card.update(snapshot.total_damage_ally, snapshot.total_damage_enemy)
 
-        if self.latest_opponent is None:
-            enemy_health = [health[5], health[6], health[7], health[8], None, health[9]]
-            self._apply_enemy_fallback(enemy_health)
+        enemy_health = [health[5], health[6], health[7], health[8], None, health[9]]
+        self._apply_enemy_health(enemy_health)
 
-    def _apply_enemy_fallback(self, enemy_health: list[int | None]) -> None:
-        for tile, value in zip(self.enemy_tiles, enemy_health):
-            tile.set_value(value, None)
-
-    def _apply_opponent(self, snapshot: OpponentSnapshot) -> None:
+    def _merge_opponent(self, snapshot: OpponentSnapshot) -> OpponentSnapshot:
+        previous = self.latest_opponent
         bullets = list(snapshot.robot_bullets[:5])
         if len(bullets) < 5:
-            bullets.extend([0] * (5 - len(bullets)))
-        enemy_values = [
-            (snapshot.robot_health[0], bullets[0]),
-            (snapshot.robot_health[1], None),
-            (snapshot.robot_health[2], bullets[1]),
-            (snapshot.robot_health[3], bullets[2]),
-            (None, bullets[3]),
-            (snapshot.robot_health[4], bullets[4]),
+            bullets.extend([None] * (5 - len(bullets)))
+
+        if previous is not None:
+            old_bullets = list(previous.robot_bullets[:5])
+            if len(old_bullets) < 5:
+                old_bullets.extend([None] * (5 - len(old_bullets)))
+            bullets = [new if new is not None else old for new, old in zip(bullets, old_bullets)]
+
+        gold = snapshot.remaining_gold
+        if gold is None and previous is not None:
+            gold = previous.remaining_gold
+
+        return OpponentSnapshot(robot_bullets=bullets, remaining_gold=gold)
+
+    def _apply_enemy_health(self, enemy_health: list[int | None]) -> None:
+        bullets = self._enemy_bullet_values()
+        for tile, value, bullet in zip(self.enemy_tiles, enemy_health, bullets):
+            tile.set_value(value, bullet)
+
+    def _enemy_bullet_values(self) -> list[int | None]:
+        bullets: list[int | None]
+        if self.latest_opponent is None:
+            bullets = []
+        else:
+            bullets = list(self.latest_opponent.robot_bullets[:5])
+        if len(bullets) < 5:
+            bullets.extend([None] * (5 - len(bullets)))
+        return [
+            bullets[0],
+            None,
+            bullets[1],
+            bullets[2],
+            bullets[3],
+            bullets[4],
         ]
-        for tile, (value, bullets) in zip(self.enemy_tiles, enemy_values):
-            tile.set_value(value, bullets)
+
+    def _apply_opponent(self, snapshot: OpponentSnapshot) -> None:
+        if self.latest_status is not None:
+            health = list(self.latest_status.robot_health[:10])
+            if len(health) < 10:
+                health.extend([0] * (10 - len(health)))
+            self._apply_enemy_health([health[5], health[6], health[7], health[8], None, health[9]])
+        else:
+            self._apply_enemy_health([None, None, None, None, None, None])
         self.money_card.update(snapshot.remaining_gold)
 
     def _cleanup_mqtt(self) -> None:
