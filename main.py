@@ -273,7 +273,7 @@ class RobotTile:
             text="-",
             bg=panel_bg,
             fg="#6b7280",
-            font=_ui_font(10),
+            font=_ui_font(13, True),
             width=5,
             anchor="center",
         )
